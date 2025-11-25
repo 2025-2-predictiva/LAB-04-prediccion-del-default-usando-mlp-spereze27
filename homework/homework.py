@@ -97,13 +97,14 @@
 # {'type': 'cm_matrix', 'dataset': 'test', 'true_0': {"predicted_0": 15562, "predicte_1": 650}, 'true_1': {"predicted_0": 2490, "predicted_1": 1420}}
 #
 
+# flake8: noqa: E501
 import os
 import json
 import gzip
 import pickle
 from glob import glob
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import pandas as pd
 from sklearn.compose import ColumnTransformer
@@ -121,79 +122,91 @@ from sklearn.neural_network import MLPClassifier
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
+# --- CONFIGURACIÓN Y CONSTANTES ---
+INPUT_TRAIN = "files/input/train_data.csv.zip"
+INPUT_TEST = "files/input/test_data.csv.zip"
+OUTPUT_MODELS = "files/models/"
+OUTPUT_METRICS = "files/output/"
+MODEL_FILENAME = "model.pkl.gz"
+METRICS_FILENAME = "metrics.json"
 
-def cargar_y_preparar(ruta_zip: str) -> pd.DataFrame:
+# --- FUNCIONES DE CARGA Y LIMPIEZA (PASO 1) ---
+
+def load_and_clean_data(filepath: str) -> pd.DataFrame:
     """
-    Lee el .csv.zip, ajusta columnas clave y aplica filtros básicos.
+    Carga el dataset y realiza la limpieza solicitada en el Paso 1.
+    
+    Acciones:
+    - Renombra columna objetivo.
+    - Elimina columna ID.
+    - Filtra registros inválidos (Marriage/Education != 0).
+    - Agrupa niveles educativos superiores a 4.
     """
-    df = pd.read_csv(ruta_zip, compression="zip").copy()
+    # Carga descomprimiendo zip
+    df = pd.read_csv(filepath, compression="zip").copy()
 
-    df.rename(columns={"default payment next month": "default"}, inplace=True)
+    # Renombre de columnas
+    if "default payment next month" in df.columns:
+        df.rename(columns={"default payment next month": "default"}, inplace=True)
 
-
+    # Eliminación de ID
     if "ID" in df.columns:
         df.drop(columns=["ID"], inplace=True)
 
+    # Filtrado de registros con información no disponible
     df = df[(df["MARRIAGE"] != 0) & (df["EDUCATION"] != 0)].copy()
 
-
+    # Agrupación de categorías educativas (>4 pasa a ser 4 'others')
     df["EDUCATION"] = df["EDUCATION"].apply(lambda v: 4 if v >= 4 else v)
-
 
     return df.dropna()
 
 
-
-def resumen_metricas(etiqueta: str, y_true, y_pred) -> Dict:
+def split_features_target(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
     """
-    Construye un diccionario con las métricas más usadas.
+    Paso 2: Separa las características (X) de la variable objetivo (y).
     """
-    return {
-        "type": "metrics",
-        "dataset": etiqueta,
-        "precision": precision_score(y_true, y_pred, zero_division=0),
-        "balanced_accuracy": balanced_accuracy_score(y_true, y_pred),
-        "recall": recall_score(y_true, y_pred, zero_division=0),
-        "f1_score": f1_score(y_true, y_pred, zero_division=0),
-    }
+    X = df.drop(columns=["default"])
+    y = df["default"]
+    return X, y
 
 
-def matriz_confusion_dict(etiqueta: str, y_true, y_pred) -> Dict:
-    """
-    Convierte la matriz de confusión en un formato más amigable para guardar.
-    """
-    tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
-    return {
-        "type": "cm_matrix",
-        "dataset": etiqueta,
-        "true_0": {"predicted_0": int(tn), "predicted_1": int(fp)},
-        "true_1": {"predicted_0": int(fn), "predicted_1": int(tp)},
-    }
+# --- PIPELINE Y MODELADO (PASO 3 Y 4) ---
 
+def build_and_optimize_pipeline(X_train: pd.DataFrame, y_train: pd.Series) -> GridSearchCV:
+    """
+    Construye el pipeline (Paso 3) y configura la búsqueda de hiperparámetros (Paso 4).
+    
+    Pipeline:
+    1. OneHotEncoder (cat) + StandardScaler (num)
+    2. SelectKBest
+    3. PCA
+    4. MLPClassifier
+    """
+    # Identificación de columnas
+    categorical_features = ["SEX", "EDUCATION", "MARRIAGE"]
+    numerical_features = [col for col in X_train.columns if col not in categorical_features]
 
-def crear_busqueda(vars_cat, vars_num) -> GridSearchCV:
-    """
-    Arma el pipeline completo (prepro + selección + PCA + MLP)
-    y define el espacio de búsqueda para GridSearchCV.
-    """
-    transformador = ColumnTransformer(
+    # Preprocesador
+    preprocessor = ColumnTransformer(
         transformers=[
-            ("cat", OneHotEncoder(), vars_cat),
-            ("num", StandardScaler(), vars_num),
+            ("cat", OneHotEncoder(), categorical_features),
+            ("num", StandardScaler(), numerical_features),
         ]
     )
 
-    pipeline_mlp = Pipeline(
+    # Definición del Pipeline
+    pipeline = Pipeline(
         steps=[
-            ("pre", transformador),
+            ("pre", preprocessor),
             ("selector", SelectKBest(score_func=f_classif)),
             ("pca", PCA()),
             ("mlp", MLPClassifier(max_iter=15000, random_state=21)),
         ]
     )
 
-
-    grid = {
+    # Espacio de búsqueda (Hiperparámetros fijos según lógica original)
+    param_grid = {
         "selector__k": [20],
         "pca__n_components": [None],
         "mlp__hidden_layer_sizes": [(50, 30, 40, 60)],
@@ -201,64 +214,119 @@ def crear_busqueda(vars_cat, vars_num) -> GridSearchCV:
         "mlp__learning_rate_init": [0.001],
     }
 
-    return GridSearchCV(
-        estimator=pipeline_mlp,
-        param_grid=grid,
+    # Configuración de Cross-Validation
+    grid_search = GridSearchCV(
+        estimator=pipeline,
+        param_grid=param_grid,
         cv=10,
         scoring="balanced_accuracy",
         n_jobs=-1,
         refit=True,
     )
+    
+    # Ajuste del modelo
+    grid_search.fit(X_train, y_train)
+    
+    return grid_search
 
 
+# --- GESTIÓN DE ARCHIVOS (PASO 5) ---
 
-
-def main() -> None:
-    ruta_train = "files/input/train_data.csv.zip"
-    ruta_test = "files/input/test_data.csv.zip"
-
-    df_tr = cargar_y_preparar(ruta_train)
-    df_te = cargar_y_preparar(ruta_test)
-
-    X_tr, y_tr = df_tr.drop(columns=["default"]), df_tr["default"]
-    X_te, y_te = df_te.drop(columns=["default"]), df_te["default"]
-
-    columnas_cat = ["SEX", "EDUCATION", "MARRIAGE"]
-    columnas_num = [c for c in X_tr.columns if c not in columnas_cat]
-
-    buscador = crear_busqueda(columnas_cat, columnas_num)
-    buscador.fit(X_tr, y_tr)
-
-    modelos_dir = Path("files/models")
-    if modelos_dir.exists():
-
-        for ruta in glob(str(modelos_dir / "*")):
-            os.remove(ruta)
+def save_model(estimator: GridSearchCV, output_path: str):
+    """
+    Guarda el modelo comprimido con gzip. Gestiona la limpieza del directorio previo.
+    """
+    output_dir = Path(output_path)
+    
+    # Limpieza de directorio existente (Lógica original preservada)
+    if output_dir.exists():
+        for file in glob(str(output_dir / "*")):
+            os.remove(file)
         try:
-            os.rmdir(modelos_dir)
+            os.rmdir(output_dir)
         except OSError:
+            pass # Ignorar si no está vacío o hay error de sistema
+            
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-            pass
-    modelos_dir.mkdir(parents=True, exist_ok=True)
+    # Guardado comprimido
+    file_path = output_dir / MODEL_FILENAME
+    with gzip.open(file_path, "wb") as f:
+        pickle.dump(estimator, f)
 
-    with gzip.open(modelos_dir / "model.pkl.gz", "wb") as fh:
-        pickle.dump(buscador, fh)
 
-    y_tr_pred = buscador.predict(X_tr)
-    y_te_pred = buscador.predict(X_te)
+def save_metrics(metrics_list: List[Dict], output_path: str):
+    """
+    Guarda la lista de métricas en un archivo JSON.
+    """
+    output_dir = Path(output_path)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    file_path = output_dir / METRICS_FILENAME
+    with open(file_path, "w", encoding="utf-8") as f:
+        for metric in metrics_list:
+            f.write(json.dumps(metric) + "\n")
 
-    m_train = resumen_metricas("train", y_tr, y_tr_pred)
-    m_test = resumen_metricas("test", y_te, y_te_pred)
-    cm_train = matriz_confusion_dict("train", y_tr, y_tr_pred)
-    cm_test = matriz_confusion_dict("test", y_te, y_te_pred)
 
-    resultados: List[Dict] = [m_train, m_test, cm_train, cm_test]
+# --- CÁLCULO DE MÉTRICAS (PASO 6 Y 7) ---
 
-    out_dir = Path("files/output")
-    out_dir.mkdir(parents=True, exist_ok=True)
-    with open(out_dir / "metrics.json", "w", encoding="utf-8") as f:
-        for registro in resultados:
-            f.write(json.dumps(registro) + "\n")
+def calculate_base_metrics(dataset_name: str, y_true, y_pred) -> Dict:
+    """Calcula precision, balanced_accuracy, recall y f1_score."""
+    return {
+        "type": "metrics",
+        "dataset": dataset_name,
+        "precision": precision_score(y_true, y_pred, zero_division=0),
+        "balanced_accuracy": balanced_accuracy_score(y_true, y_pred),
+        "recall": recall_score(y_true, y_pred, zero_division=0),
+        "f1_score": f1_score(y_true, y_pred, zero_division=0),
+    }
+
+
+def calculate_confusion_matrix(dataset_name: str, y_true, y_pred) -> Dict:
+    """Calcula y formatea la matriz de confusión."""
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
+    return {
+        "type": "cm_matrix",
+        "dataset": dataset_name,
+        "true_0": {"predicted_0": int(tn), "predicted_1": int(fp)},
+        "true_1": {"predicted_0": int(fn), "predicted_1": int(tp)},
+    }
+
+
+# --- ORQUESTADOR PRINCIPAL ---
+
+def main():
+    # 1. Carga y Limpieza
+    print("Cargando y limpiando datos...")
+    df_train = load_and_clean_data(INPUT_TRAIN)
+    df_test = load_and_clean_data(INPUT_TEST)
+
+    # 2. División X/y
+    X_train, y_train = split_features_target(df_train)
+    X_test, y_test = split_features_target(df_test)
+
+    # 3. y 4. Construcción y Optimización del Pipeline
+    print("Entrenando modelo (esto puede tardar)...")
+    estimator = build_and_optimize_pipeline(X_train, y_train)
+
+    # 5. Guardado del Modelo
+    print("Guardando modelo...")
+    save_model(estimator, OUTPUT_MODELS)
+
+    # 6. y 7. Cálculo de Métricas
+    print("Calculando métricas...")
+    y_train_pred = estimator.predict(X_train)
+    y_test_pred = estimator.predict(X_test)
+
+    metrics_results = [
+        calculate_base_metrics("train", y_train, y_train_pred),
+        calculate_base_metrics("test", y_test, y_test_pred),
+        calculate_confusion_matrix("train", y_train, y_train_pred),
+        calculate_confusion_matrix("test", y_test, y_test_pred),
+    ]
+
+    save_metrics(metrics_results, OUTPUT_METRICS)
+    print("Proceso finalizado exitosamente.")
 
 
 if __name__ == "__main__":
